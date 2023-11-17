@@ -1,63 +1,103 @@
 ﻿using Dapper;
 using Microsoft.Data.SqlClient;
 using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.DataProtection.KeyManagement;
 
 class Program
 {
     async static Task Main(string[] args)
     {
-        if (args.Length != 1)
+        string connectionString;
+        Func<Guid, string?> keyRingSearcher;
+        if (args.Length == 2)
         {
-            throw new ArgumentException("Expected 1 arguments, [connection-string]");
+            connectionString = args[0];
+            
+            var services = new ServiceCollection();
+
+            var builder = services.AddDataProtection(options =>
+            {
+                options.ApplicationDiscriminator = "Bitwarden";
+            });
+
+            var keysDirectory = new DirectoryInfo(args[1]);
+            if (!keysDirectory.Exists)
+            {
+                throw new ArgumentException($"Given keys directory '{args[1]}' does not exist.");
+            }
+
+            builder.PersistKeysToFileSystem(keysDirectory);
+
+            var provider = services.BuildServiceProvider();
+
+            var keyManager = provider.GetRequiredService<IKeyManager>();
+            var keys = keyManager.GetAllKeys();
+
+            var now = DateTimeOffset.UtcNow;
+
+            keyRingSearcher = (keyId) =>
+            {
+                IKey? keyInKeyRing = keys.First(k => k.KeyId == keyId);
+                if (keyInKeyRing == null)
+                {
+                    return "Not Found";
+                }
+                else
+                {
+                    return keyInKeyRing.IsRevoked
+                        ? "Revoked"
+                        : now > keyInKeyRing.ActivationDate
+                            ? now > keyInKeyRing.ExpirationDate
+                             ? "Expired"
+                             : "Active"
+                            : "Created";
+                }
+            };
+        }
+        else if (args.Length == 1)
+        {
+            connectionString = args[0];
+            keyRingSearcher = (_) => null;
+        }
+        else
+        {
+            throw new ArgumentException("Expected 1 or 2 arguments, [connection-string] [?data-protection-keys-directory?]");
         }
 
-        // var services = new ServiceCollection();
+        
 
-        // var builder = services.AddDataProtection(options =>
-        // {
-        //     options.ApplicationDiscriminator = "Bitwarden";
-        // });
-
-        // var keysDirectory = new DirectoryInfo(args[1]);
-        // if (!keysDirectory.Exists)
-        // {
-        //     throw new ArgumentException($"Given keys directory '{args[1]}' does not exist.");
-        // }
-
-        // builder.PersistKeysToFileSystem(keysDirectory);
-
-        // var provider = services.BuildServiceProvider();
-
-        // var keyManager = provider.GetRequiredService<IKeyManager>();
-        // var keys = keyManager.GetAllKeys();
-
-        // var decryptor = provider.GetRequiredService<IDataProtectionProvider>();
-        // Console.WriteLine(decryptor.GetType().FullName);
+        Console.WriteLine("UserId,MasterPasswordKeyRingId,MasterPasswordKeyStatus,KeyKeyRingId,KeyKeyStatus");
 
         var users = await GetUsers(args[0]);
         foreach (var user in users)
         {
             Guid? masterPasswordKeyId = null;
+            string? masterPasswordKeyStatus = null;
             if (!string.IsNullOrEmpty(user.MasterPassword) && user.MasterPassword.StartsWith("P|"))
             {
                 var masterPasswordBytes = WebEncoders.Base64UrlDecode(user.MasterPassword[2..]);
                 if (TryReadKeyId(masterPasswordBytes, out var keyId))
                 {
                     masterPasswordKeyId = keyId;
+                    masterPasswordKeyStatus = keyRingSearcher(keyId);
                 }
             }
 
             Guid? keyKeyId = null;
+            string? keyKeyStatus = null;
             if (!string.IsNullOrEmpty(user.Key) && user.Key.StartsWith("P|"))
             {
                 var keyBytes = WebEncoders.Base64UrlDecode(user.Key[2..]);
                 if (TryReadKeyId(keyBytes, out var keyId))
                 {
                     keyKeyId = keyId;
+                    keyKeyStatus = keyRingSearcher(keyId);
                 }
             }
 
-            Console.WriteLine($"{user.Id},{masterPasswordKeyId},{keyKeyId}");
+            Console.WriteLine($"{user.Id},{masterPasswordKeyId},{masterPasswordKeyStatus},{keyKeyId},{keyKeyStatus}");
         }
     }
 
